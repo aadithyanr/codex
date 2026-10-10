@@ -437,31 +437,77 @@ async fn missing_authoritative_credentials_require_reauthorization() -> Result<(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn rejected_refresh_token_requires_reauthorization() -> Result<()> {
-    let (_env, server, initial) = test_context().await?;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .and(body_string_contains("grant_type=refresh_token"))
-        .and(body_string_contains("refresh_token=refresh-token"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-            "error": "invalid_grant",
-            "error_description": "refresh token expired or revoked",
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    save_oauth_tokens_to_file(&initial)?;
-    let persistor = persistor_for(&initial).await?;
+async fn rejected_refresh_token_is_removed_and_requires_reauthorization() -> Result<()> {
+    for mode in [
+        crate::McpOAuthRefreshMode::Legacy,
+        crate::McpOAuthRefreshMode::Coordinated,
+    ] {
+        let (_env, server, initial) = test_context().await?;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=refresh-token"))
+            .respond_with(invalid_grant_response())
+            .expect(1)
+            .mount(&server)
+            .await;
+        save_oauth_tokens_to_file(&initial)?;
+        let runtime = runtime_for(&initial, mode).await?;
 
-    let error = persistor
-        .refresh_if_needed()
-        .await
-        .expect_err("a provider-rejected refresh token should require reauthorization");
-    assert!(is_authentication_required_error(&error));
-    let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
-        .expect("rejected refresh must preserve the durable credentials");
-    assert_tokens_match_without_expiry(&stored, &initial);
-    server.verify().await;
+        let error = runtime
+            .refresh_if_needed()
+            .await
+            .expect_err("a provider-rejected refresh token should require reauthorization");
+        assert!(is_authentication_required_error(&error));
+        // The legacy RMCP persistence hook must not write the rejected credential back.
+        if let OAuthRuntime::Legacy(persistor) = &runtime {
+            persistor.persist_if_needed().await?;
+        }
+        assert_eq!(
+            load_oauth_tokens_from_file(&initial.server_name, &initial.url)?,
+            None
+        );
+        server.verify().await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_refresh_preserves_login_completed_during_request() -> Result<()> {
+    for mode in [
+        crate::McpOAuthRefreshMode::Legacy,
+        crate::McpOAuthRefreshMode::Coordinated,
+    ] {
+        let (_env, server, initial) = test_context().await?;
+        let mut replacement = initial.clone();
+        replacement
+            .token_response
+            .0
+            .set_refresh_token(Some(RefreshToken::new("new-login-refresh-token".into())));
+        save_oauth_tokens_to_file(&initial)?;
+        let runtime = runtime_for(&initial, mode).await?;
+        let provider_replacement = replacement.clone();
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(move |_request: &wiremock::Request| {
+                save_oauth_tokens_to_file(&provider_replacement).expect("complete new login");
+                invalid_grant_response()
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = runtime
+            .refresh_if_needed()
+            .await
+            .expect_err("a provider-rejected refresh token should require reauthorization");
+        assert!(is_authentication_required_error(&error));
+        let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
+            .expect("the replacement login must not be deleted");
+        assert_tokens_match_without_expiry(&stored, &replacement);
+        server.verify().await;
+    }
     Ok(())
 }
 
@@ -938,6 +984,13 @@ async fn mount_oauth_metadata(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
+
+fn invalid_grant_response() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        "error": "invalid_grant",
+        "error_description": "refresh token expired or revoked",
+    }))
 }
 
 async fn mount_delayed_refresh(server: &MockServer, response_access_token: &str) {

@@ -203,6 +203,22 @@ impl OAuthPersistor {
                     error = %error,
                     "MCP OAuth refresh token was rejected; reauthorization required"
                 );
+                match self.inner.credential_store.delete_rejected(
+                    keyring_store,
+                    &self.inner.server_name,
+                    &self.inner.url,
+                    &latest,
+                ) {
+                    Ok(true) => {
+                        guard.set_credential_store(InMemoryCredentialStore::new());
+                        *self.inner.last_credentials.lock().await = None;
+                    }
+                    Ok(false) => {}
+                    Err(delete_error) => warn!(
+                        error = %delete_error,
+                        "failed to remove rejected MCP OAuth credentials"
+                    ),
+                }
                 return Err(AuthError::AuthorizationRequired).with_context(|| {
                     format!(
                         "failed to refresh OAuth tokens for server {}: {error}",

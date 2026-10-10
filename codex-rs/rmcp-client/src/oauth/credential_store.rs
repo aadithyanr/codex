@@ -110,7 +110,7 @@ impl<K: KeyringStore + Clone + 'static> OAuthCredentialStore<K> {
         // Reuse the guard for RMCP's exchange and save after the locked freshness check.
         manager.set_credential_store(Self {
             inner: Arc::clone(&self.inner),
-            held_refresh_guard: Some(guard),
+            held_refresh_guard: Some(Arc::clone(&guard)),
         });
         let result = PROACTIVE_REFRESH_TIMEOUT
             .scope(REFRESH_REQUEST_TIMEOUT, manager.refresh_token())
@@ -118,8 +118,36 @@ impl<K: KeyringStore + Clone + 'static> OAuthCredentialStore<K> {
         manager.set_credential_store(self.clone());
         match result {
             Ok(_) => Ok(()),
-            Err(AuthError::TokenRefreshRejected(_)) => Err(AuthError::AuthorizationRequired.into()),
+            Err(AuthError::TokenRefreshRejected(_)) => {
+                self.delete_rejected(guard, tokens).await;
+                Err(AuthError::AuthorizationRequired.into())
+            }
             Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn delete_rejected(
+        &self,
+        guard: Arc<RefreshCredentialLock>,
+        rejected: StoredOAuthTokens,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let result = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            inner
+                .store
+                .delete_rejected(&inner.keyring, &inner.server_name, &inner.url, &rejected)
+        })
+        .await
+        .context("OAuth credential removal task failed");
+        match result {
+            Ok(Ok(true)) => *self.inner.last_credentials.lock().await = None,
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) | Err(error) => warn!(
+                server_name = %self.inner.server_name,
+                error = %error,
+                "failed to remove rejected MCP OAuth credentials"
+            ),
         }
     }
 

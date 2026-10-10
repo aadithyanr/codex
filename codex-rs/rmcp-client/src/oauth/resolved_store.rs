@@ -10,6 +10,8 @@ use codex_keyring_store::KeyringStore;
 use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_otel::auth_storage::Operation;
 use codex_otel::auth_storage::Store;
+use oauth2::RefreshToken;
+use oauth2::TokenResponse;
 
 use super::OAuthKeyringLoadError;
 use super::OAuthStore;
@@ -217,6 +219,31 @@ impl ResolvedOAuthCredentialStore {
             telemetry::record_secure_error(&mut observation, error.as_ref());
         }
         result
+    }
+
+    /// Deletes credentials whose refresh token the provider rejected, preserving any replacement
+    /// login that completed during the refresh request.
+    pub(crate) fn delete_rejected<K: KeyringStore + Clone + 'static>(
+        self,
+        keyring_store: &K,
+        server_name: &str,
+        url: &str,
+        rejected: &StoredOAuthTokens,
+    ) -> Result<bool> {
+        let rejected_refresh_token = rejected.token_response.0.refresh_token();
+        let stored = self.load(keyring_store, server_name, url)?;
+        let still_holds_rejected_token = stored.is_some_and(|stored| {
+            stored
+                .token_response
+                .0
+                .refresh_token()
+                .map(RefreshToken::secret)
+                == rejected_refresh_token.map(RefreshToken::secret)
+        });
+        if !still_holds_rejected_token {
+            return Ok(false);
+        }
+        self.delete(keyring_store, server_name, url)
     }
 }
 
